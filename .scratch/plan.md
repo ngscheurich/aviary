@@ -283,6 +283,7 @@ allocation: lowest free port from 4000 upward, persisted in a per-worktree
     via CLI flags (`--mount-owned`) since they have no YAML form. Scripts use
     `$VAR` (no braces) because msb substitutes `${VAR}` across the whole file.
   - ✅ `sandbox/check-toolchain.sh` (V0e/V1–V3 subset assertions).
+    **Retired in Phase 5**: fully subsumed by verify.sh's V1–V4; deleted.
   - Discovered: Aviary dev/test configs already point at
     `localhost:postgres:postgres` with DB names `aviary_dev`/`aviary_test`,
     so no `DATABASE_URL` env is needed — in-VM postgres with trust auth

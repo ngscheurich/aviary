@@ -33,4 +33,12 @@ if ! command -v msb >/dev/null 2>&1; then
 fi
 msb load --input "$tarball"
 
-echo "==> done: $flavor:latest is cached for msb. Verify with: sandbox/check-image.sh $flavor"
+# Image contract test: boot a throwaway sandbox from the freshly loaded image
+# and assert its contents, so a Dockerfile regression can't slip in silently.
+echo "==> verifying image ($flavor)"
+if ! "$here/check-image.sh" "$flavor"; then
+  echo "error: image verification failed — not marking this build as good" >&2
+  exit 1
+fi
+
+echo "==> done: $flavor:latest loaded and verified. Ready for: bin/sandbox up"

@@ -76,9 +76,14 @@ invariants (build path, deps path, asset binaries), in-VM tests, the
 ELF-leak check (no Linux binary ever appears in the worktree), host `_build`
 non-interference, concurrent host+VM compiles, and the HTTP/code-reload
 gate. `sandbox/verify-worktrees.sh` (V9–V11) covers sandbox-per-worktree
-naming, all-pairs database isolation, and port distinctness. The suite never
+naming, all-pairs database isolation, and port distinctness. Neither suite
 mutates the host; if the host isn't bootstrapped for the project, V7 skips
 with the exact commands to run.
+
+A third gate runs automatically: `sandbox build` finishes by booting a
+throwaway sandbox and running `sandbox/check-image.sh` (the image contract
+test — alpine, mise, build toolchain, postgres, inotify), so a Dockerfile
+regression fails the build instead of surfacing later in a dev VM.
 
 ## Troubleshooting
 
