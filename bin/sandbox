@@ -1,0 +1,213 @@
+#!/bin/sh
+# sandbox — Phoenix microsandbox dev wrapper. See .scratch/plan.md §6.
+#
+# One microsandbox VM per git worktree. Sandbox name: phx-<worktree-basename>
+# (basename disambiguated with a path hash if two worktrees share a name).
+# Ports are allocated host-side from 4001 up (4000 stays free for the host's
+# own `mix phx.server`) and recorded in ~/.config/phoenix-sandbox/ports.
+#
+# Usage:
+#   sandbox build [flavor]     build + msb load the image (sandbox/build.sh)
+#   sandbox up                 create-or-start the VM (bootstrap on creation)
+#   sandbox setup              run `mix setup` inside the VM
+#   sandbox server             run postgres + `mix phx.server` (foreground)
+#   sandbox test               run `mix test` inside the VM
+#   sandbox precommit          run `mix precommit` inside the VM
+#   sandbox exec [cmd...]      run a command inside the VM (adds `--` if given)
+#   sandbox shell              interactive shell inside the VM
+#   sandbox status             sandbox status
+#   sandbox logs               sandbox logs
+#   sandbox stop               stop the VM (state preserved)
+#   sandbox rm                  remove the VM (owned volumes die with it)
+#   sandbox port               show this worktree's forwarded host port
+#   sandbox verify             run the deterministic verification suite
+#   sandbox verify-worktrees   run the multi-worktree suite (V9-V11)
+#   sandbox worktrees          overview: all worktrees, their VMs and ports
+set -eu
+
+# --- repo / worktree identity ------------------------------------------------
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "error: not inside a git worktree" >&2
+  exit 1
+}
+sandbox_dir="$root/sandbox"
+
+wt_list_paths() {
+  git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p'
+}
+
+wt_name_for_path() { # <path> — worktree basename, disambiguated on collisions
+  p="$1"
+  # printf avoids basename's trailing newline (which tr would map to '-')
+  base="$(printf '%s' "$(basename "$p")" | tr -c 'a-zA-Z0-9-' '-')"
+  collision=0
+  while IFS= read -r other; do
+    [ -n "$other" ] || continue
+    if [ "$other" != "$p" ] && [ "$(basename "$other")" = "$(basename "$p")" ]; then
+      collision=1
+      break
+    fi
+  done <<EOF
+$(wt_list_paths)
+EOF
+  if [ "$collision" = 1 ]; then
+    printf '%s-%s\n' "$base" "$(printf '%s' "$p" | hash_stdin | cut -c1-6)"
+  else
+    printf '%s\n' "$base"
+  fi
+}
+
+wt_name="$(wt_name_for_path "$root")"
+sbx="phx-$wt_name"
+
+# --- port registry ------------------------------------------------------------
+ports_file="${PHX_SANDBOX_PORTS:-$HOME/.config/phoenix-sandbox/ports}"
+
+hash_stdin() { if command -v shasum >/dev/null 2>&1; then shasum; else sha256sum; fi; }
+
+registered_port() { # <name> -> port or nothing; exit 0 when registry is absent
+  [ -f "$ports_file" ] || return 0
+  awk -v n="$1" '$1 == n { print $2; exit }' "$ports_file"
+}
+
+port_used_by_other() { # <port> <name> -> 0 if another sandbox holds the port
+  [ -f "$ports_file" ] || return 1
+  awk -v p="$1" -v me="$2" 'BEGIN { r = 1 }
+    $2 == p && $1 != me { r = 0 } END { exit r }' "$ports_file"
+}
+
+port_in_use_by_host() { nc -z 127.0.0.1 "$1" >/dev/null 2>&1; }
+
+set_port() { # <name> <port> — create/overwrite the registry entry
+  mkdir -p "$(dirname "$ports_file")"
+  tmp_ports="$(mktemp)"
+  awk -v n="$1" -v p="$2" '
+    $1 == n { $2 = p; found = 1 }
+    { print }
+    END { if (!found) print n, p }
+  ' "$ports_file" > "$tmp_ports"
+  mv "$tmp_ports" "$ports_file"
+}
+
+port_for() { # <name> -> allocated (and registered) port, from 4001 upward
+  name="$1"
+  p="$(registered_port "$name")"
+  if [ -n "$p" ]; then
+    printf '%s\n' "$p"
+    return 0
+  fi
+  p=4001
+  while [ "$p" -lt 4100 ]; do
+    if ! port_in_use_by_host "$p" && ! port_used_by_other "$p" "$name"; then
+      mkdir -p "$(dirname "$ports_file")"
+      printf '%s %s\n' "$name" "$p" >> "$ports_file"
+      printf '%s\n' "$p"
+      return 0
+    fi
+    p=$((p + 1))
+  done
+  echo "error: no free host port in 4001..4099" >&2
+  return 1
+}
+
+# --- msb helpers --------------------------------------------------------------
+sbx_exists() { msb ls -q 2>/dev/null | grep -qx "$1"; }
+sbx_running() { msb ps "$1" >/dev/null 2>&1; }
+
+create_sandbox() {
+  port="$(port_for "$sbx")"
+  WORKTREE_NAME="$wt_name" WORKTREE_PATH="$root" HOST_PORT="$port" \
+    msb create --name "$sbx" --conf "$sandbox_dir/sandbox.yaml" \
+      --mount-owned /vm/artifacts:quota=8G \
+      --mount-owned /var/lib/postgresql/data:quota=2G
+}
+
+cmd="${1:-up}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  build)
+    exec "$sandbox_dir/build.sh" "${1:-phoenix-base}"
+    ;;
+  up)
+    if sbx_exists "$sbx"; then
+      msb start "$sbx" >/dev/null 2>&1 || true
+      echo "up: $sbx (http://127.0.0.1:$(port_for "$sbx"))"
+    else
+      echo "up: creating $sbx (first boot: toolchain bootstrap follows)"
+      create_sandbox
+      echo "up: running bootstrap (idempotent; first Erlang build ~10-15 min)"
+      msb exec "$sbx" -- bootstrap
+      echo "up: done (http://127.0.0.1:$(port_for "$sbx"))"
+    fi
+    ;;
+  setup)
+    msb exec "$sbx" -- setup
+    ;;
+  server)
+    msb start "$sbx" >/dev/null 2>&1 || true   # keep VM up after Ctrl-C
+    msb exec "$sbx" -- server
+    ;;
+  test)
+    # NOTE: `msb exec -- test` would resolve /usr/bin/test (or the builtin),
+    # so we inline the db-start + mix test pair instead.
+    msb exec "$sbx" -- sh -c 'db-start && mix test'
+    ;;
+  precommit)
+    msb exec "$sbx" -- sh -c 'mix precommit'
+    ;;
+  exec)
+    if [ "${1:-}" = "--" ]; then shift; fi
+    [ $# -gt 0 ] || { echo "error: sandbox exec needs a command" >&2; exit 1; }
+    msb exec "$sbx" -- "$@"
+    ;;
+  shell)
+    msb exec "$sbx" -- bash
+    ;;
+  status)
+    msb ps "$sbx"
+    ;;
+  logs)
+    msb logs "$sbx"
+    ;;
+  stop)
+    msb stop "$sbx"
+    ;;
+  rm)
+    sbx_exists "$sbx" || { echo "rm: no sandbox $sbx" >&2; exit 1; }
+    msb rm "$sbx"
+    ;;
+  port)
+    if [ "${1:-}" = "--set" ] && [ -n "${2:-}" ]; then
+      set_port "$sbx" "$2"
+      echo "port: $sbx -> $2"
+    else
+      port_for "$sbx"
+    fi
+    ;;
+  verify)
+    exec "$sandbox_dir/verify.sh" "$sbx" "$(port_for "$sbx")" "$root" "$wt_name"
+    ;;
+  verify-worktrees)
+    exec "$sandbox_dir/verify-worktrees.sh"
+    ;;
+  worktrees)
+    printf '%-24s %-6s %-4s %s\n' "WORKTREE" "PORT" "VM" "STATE"
+    wt_list_paths | while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      n="phx-$(wt_name_for_path "$p")"
+      pt="$(registered_port "$n")"
+      if sbx_exists "$n"; then
+        if sbx_running "$n"; then state="running"; else state="stopped"; fi
+        exists="yes"
+      else
+        pt=""; exists="-"; state="-"
+      fi
+      printf '%-24s %-6s %-4s %s\n' "$n" "$pt" "$exists" "$state"
+    done
+    ;;
+  *)
+    echo "error: unknown command: $cmd (see sandbox --help / header of this file)" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,101 @@
+# Sandbox configuration for Phoenix dev VMs. See .scratch/plan.md §4.
+#
+# Values are injected via msb's ${NAME} environment substitution (set by the
+# wrapper, or exported manually for one-off runs):
+#
+#   WORKTREE_NAME   worktree directory basename, e.g. "aviary"
+#   WORKTREE_PATH   absolute host worktree path
+#   HOST_PORT       host port forwarded to the guest Phoenix server
+#
+# Owned mounts have no YAML form (CLI-only); the create command must also pass:
+#   --mount-owned /vm/artifacts:quota=8G
+#   --mount-owned /var/lib/postgresql/data:quota=2G
+#
+# NOTE: msb substitutes ${VAR} across this file, so shell snippets in
+# `scripts:` must use $VAR (no braces) for guest-side shell variables.
+
+image: phoenix-base:latest
+cpus: 2
+memory: "4G"
+shell: "/bin/bash"
+workdir: "/workspace/${WORKTREE_NAME}"
+hostname: "${WORKTREE_NAME}"
+
+env:
+  # Published-port forwarding reaches the guest's network interface, not its
+  # loopback; dev.exs binds {127,0,0,1} unless this is set (it then binds
+  # {0,0,0,0} — safe here: inbound is only accepted on published ports).
+  PHX_BIND_ALL: "1"
+  # Keep every platform-flavored build artifact out of the (macOS-host)
+  # worktree: _build/ contents AND the esbuild/tailwind binaries the mix
+  # tasks download (they install next to the build root).
+  MIX_BUILD_ROOT: "/vm/artifacts/_build"
+  # XDG layout so the hex package cache lives in /root/.cache/hex,
+  # which is the shared hex-cache named volume.
+  MIX_XDG: "1"
+  # Non-interactive mise (auto-trust config files, etc.)
+  MISE_YES: "1"
+  # kerl staging/downloads inside this sandbox's artifacts volume, so OTP
+  # source builds never fill the rootfs and never collide across sandboxes.
+  KERL_BASE_DIR: "/vm/artifacts/.kerl"
+  # Headless OTP: no wx/odbc/javac in the image (see sandbox/Dockerfile).
+  KERL_CONFIGURE_OPTIONS: "--without-javac --without-wx --without-odbc"
+
+mounts:
+  # The worktree is the shared source plane (host editor <-> VM). rw: VM-side
+  # generators and `mix format` write portable source files back to the host.
+  # deps/ deliberately stays here (the asset pipeline references deps/ by
+  # relative path); `MIX_DEPS_PATH` is intentionally NOT set.
+  - "${WORKTREE_PATH}:/workspace/${WORKTREE_NAME}:rw"
+  # Shared caches across all worktree sandboxes (plan §5):
+  #   mise-store — compiled toolchains, one directory per version (drift-safe)
+  #   hex-cache  — uncompiled package tarballs, content-addressed
+  - { named: mise-store, target: /root/.local/share/mise, create: ensure-exists }
+  - { named: hex-cache,  target: /root/.cache/hex,       create: ensure-exists }
+  # /tmp must be exec-permitted: the tailwind CLI is a Bun single-file
+  # executable that extracts native modules (lightningcss .node) to $TMPDIR
+  # and dlopen()s them — dlopen from a noexec mount fails with EPERM.
+  - { tmpfs: { size: "512M" }, target: /tmp }
+
+network:
+  # Public egress for hex.pm / github; inbound only via published ports.
+  policy: public
+  ports:
+    - "${HOST_PORT}:4000"
+
+scripts:
+  # First-boot provisioning: toolchain from the worktree's mise.toml (cached
+  # in mise-store after the first build of each version), then init postgres.
+  # Idempotent — safe to re-run.
+  bootstrap: |
+    set -eu
+    mise trust
+    mise install
+    PGDATA=/var/lib/postgresql/data
+    mkdir -p /run/postgresql && chown postgres:postgres /run/postgresql
+    if [ ! -s "$PGDATA/PG_VERSION" ]; then
+      mkdir -p "$PGDATA"
+      chown -R postgres:postgres "$PGDATA"
+      su-exec postgres initdb -D "$PGDATA" --auth=trust
+      printf "listen_addresses = 'localhost'\n" >> "$PGDATA/postgresql.conf"
+    fi
+    mix local.hex --force --if-missing
+    mix local.rebar --force --if-missing
+  db-start: |
+    set -eu
+    mkdir -p /run/postgresql && chown postgres:postgres /run/postgresql
+    PGDATA=/var/lib/postgresql/data
+    if ! su-exec postgres pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
+      su-exec postgres pg_ctl -D "$PGDATA" -w -l /tmp/postgresql.log start
+    fi
+  setup: |
+    set -eu
+    db-start
+    mix setup
+  server: |
+    set -eu
+    db-start
+    mix phx.server
+  # NOTE: there is deliberately no `test` script — the name collides with
+  # /usr/bin/test and the shell builtin when run via `msb exec -- test`.
+  # The wrapper inlines `sh -c 'db-start && mix test'` instead.
